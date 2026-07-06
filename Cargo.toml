@@ -1,0 +1,27 @@
+[package]
+name = "vcp-iptv-manager"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "gzip", "brotli"] }
+scraper = "0.22"
+rusqlite = { version = "0.34", features = ["bundled", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio-cron-scheduler = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+tower-http = { version = "0.6", features = ["cors"] }
+url = "2"
+async-trait = "0.1"
+futures = "0.3"
+
+[[bin]]
+name = "vcp-iptv-manager"
+path = "src/main.rs"
