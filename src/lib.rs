@@ -14,4 +14,6 @@ pub struct AppState {
     pub verifier: Arc<verifier::Verifier>,
     /// 共享 HTTP 客户端（用于播源拉取等）
     pub client: reqwest::Client,
+    /// vcp-media-manager 基础 URL（用于转发拉流验证任务）
+    pub media_manager_url: String,
 }

@@ -51,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
         db: db.clone(),
         verifier: verifier.clone(),
         client: client.clone(),
+        media_manager_url: config.media_manager_url.clone(),
     });
 
     // 启动定时任务调度器（M3U 播源拉取 + 验证）

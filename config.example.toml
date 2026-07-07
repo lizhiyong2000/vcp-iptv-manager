@@ -20,6 +20,9 @@ request_timeout_secs = 30
 # 验证并发数
 verify_concurrency = 20
 
+# vcp-media-manager 地址（用于转发拉流验证任务）
+media_manager_url = "http://127.0.0.1:8090"
+
 # 初始播源列表（启动时自动注入数据库，已存在的跳过）
 # [[sources]]
 # name = "my-source"

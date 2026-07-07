@@ -1,5 +1,6 @@
 pub mod channels;
 pub mod playitems;
+pub mod pull_validate;
 pub mod sources;
 
 use axum::Router;
@@ -50,5 +51,10 @@ pub fn build_router() -> Router<Arc<AppState>> {
         .route(
             "/api/sources/{id}/fetch",
             axum::routing::post(sources::fetch_source_now),
+        )
+        // 拉流验证（批量提交 RTMP/RTSP 拉流任务到 media-manager）
+        .route(
+            "/api/pull/validate",
+            axum::routing::post(pull_validate::pull_validate),
         )
 }
