@@ -1,5 +1,22 @@
-use chrono::NaiveDateTime;
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Local, NaiveDateTime, Utc};
+use serde::{Deserialize, Serialize, Serializer};
+
+// ---- 时间序列化辅助函数：将 UTC NaiveDateTime 转为本地时间字符串 ----
+
+/// 序列化 `NaiveDateTime`（解读为 UTC）为本地时间字符串
+fn serialize_dt_local<S: Serializer>(dt: &NaiveDateTime, s: S) -> Result<S::Ok, S::Error> {
+    let utc_dt: DateTime<Utc> = DateTime::from_naive_utc_and_offset(*dt, Utc);
+    let local = utc_dt.with_timezone(&Local);
+    s.serialize_str(&local.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
+/// 序列化 `Option<NaiveDateTime>`（解读为 UTC）为本地时间字符串
+fn serialize_opt_dt_local<S: Serializer>(dt: &Option<NaiveDateTime>, s: S) -> Result<S::Ok, S::Error> {
+    match dt {
+        Some(dt) => serialize_dt_local(dt, s),
+        None => s.serialize_none(),
+    }
+}
 
 /// 频道模型
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -9,7 +26,9 @@ pub struct Channel {
     pub source: String,
     pub category: Option<String>,
     pub logo_url: Option<String>,
+    #[serde(serialize_with = "serialize_dt_local")]
     pub created_at: NaiveDateTime,
+    #[serde(serialize_with = "serialize_dt_local")]
     pub updated_at: NaiveDateTime,
 }
 
@@ -23,10 +42,13 @@ pub struct PlayItem {
     pub category: Option<String>,
     pub is_valid: bool,
     pub fail_count: i32,
+    #[serde(serialize_with = "serialize_opt_dt_local")]
     pub last_checked: Option<NaiveDateTime>,
     pub resolution: Option<String>,
     pub bitrate: Option<i64>,
+    #[serde(serialize_with = "serialize_dt_local")]
     pub created_at: NaiveDateTime,
+    #[serde(serialize_with = "serialize_dt_local")]
     pub updated_at: NaiveDateTime,
 }
 
@@ -57,8 +79,11 @@ pub struct PlaylistSource {
     /// 上次拉取状态：ok / error
     pub last_status: Option<String>,
     /// 上次拉取时间
+    #[serde(serialize_with = "serialize_opt_dt_local")]
     pub last_fetch_at: Option<NaiveDateTime>,
+    #[serde(serialize_with = "serialize_dt_local")]
     pub created_at: NaiveDateTime,
+    #[serde(serialize_with = "serialize_dt_local")]
     pub updated_at: NaiveDateTime,
 }
 
