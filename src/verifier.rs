@@ -108,6 +108,12 @@ impl Verifier {
         client: &reqwest::Client,
         item: &PlayItem,
     ) -> Result<(bool, Option<String>, Option<i64>)> {
+        let url_lower = item.url.to_lowercase();
+        // 跳过非 HTTP/HTTPS 协议（如 rtp://、udp://、rtmp:// 等）
+        if !url_lower.starts_with("http://") && !url_lower.starts_with("https://") {
+            return Ok((false, None, None));
+        }
+
         let resp = client.get(&item.url).send().await?;
 
         // 检查 HTTP 状态码

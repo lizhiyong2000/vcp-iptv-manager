@@ -34,6 +34,8 @@ pub fn build_router() -> Router<Arc<AppState>> {
         .route("/api/stats", axum::routing::get(playitems::get_stats))
         // 手动触发爬取+验证
         .route("/api/scrape", axum::routing::post(playitems::trigger_scrape))
+        // 手动触发仅验证（不拉取播源）
+        .route("/api/verify", axum::routing::post(playitems::trigger_verify))
         // 播源管理
         .route("/api/sources", axum::routing::get(sources::list_sources))
         .route("/api/sources", axum::routing::post(sources::add_source))

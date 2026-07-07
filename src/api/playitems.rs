@@ -111,6 +111,34 @@ pub async fn get_stats(
     }
 }
 
+/// 手动触发仅验证（不拉取播源，仅验证未验证的播放地址）
+pub async fn trigger_verify(
+    State(state): State<Arc<AppState>>,
+) -> Json<ApiResponse<String>> {
+    let verifier = state.verifier.clone();
+
+    tokio::spawn(async move {
+        tracing::info!("手动触发验证任务");
+        match verifier.verify_unchecked().await {
+            Ok(result) => {
+                tracing::info!(
+                    "验证完成: 总数={}, 有效={}, 无效={}",
+                    result.total,
+                    result.valid,
+                    result.invalid,
+                );
+            }
+            Err(e) => {
+                tracing::error!("验证失败: {}", e);
+            }
+        }
+    });
+
+    Json(ApiResponse::success(
+        "验证任务已触发，正在后台执行".to_string(),
+    ))
+}
+
 /// 手动触发完整爬取任务（所有启用的播源）
 pub async fn trigger_scrape(
     State(state): State<Arc<AppState>>,
