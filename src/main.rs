@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     info!("vcp-iptv-manager 启动中...");
 
     // 加载配置
-    let config = Config::from_env_or_default();
+    let config = Config::from_file_or_default();
     info!("配置: {:?}", config);
 
     // 初始化数据库

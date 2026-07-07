@@ -1,0 +1,27 @@
+# vcp-iptv-manager 配置文件模板
+# 复制为 config.toml 后修改使用
+
+# 数据库路径
+db_path = "data/iptv.db"
+
+# HTTP 监听地址和端口
+host = "0.0.0.0"
+port = 5001
+
+# 播源拉取间隔（秒）
+scrape_interval_secs = 3600
+
+# 流地址验证超时（秒）
+verify_timeout_secs = 10
+
+# HTTP 请求超时（秒）
+request_timeout_secs = 30
+
+# 验证并发数
+verify_concurrency = 20
+
+# 初始播源列表（启动时自动注入数据库，已存在的跳过）
+# [[sources]]
+# name = "my-source"
+# url = "https://example.com/iptv.m3u"
+# category = "综合"

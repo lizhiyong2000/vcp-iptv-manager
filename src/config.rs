@@ -1,5 +1,14 @@
 use serde::Deserialize;
 
+/// 播源配置项
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceConfig {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub category: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default = "default_db_path")]
@@ -16,10 +25,9 @@ pub struct Config {
     pub request_timeout_secs: u64,
     #[serde(default = "default_verify_concurrency")]
     pub verify_concurrency: usize,
-    /// 初始播源列表: "名称,URL,分类" 用分号分隔多个
-    /// 例如: "my-source,https://example.com/tv.m3u,综合;other,https://other.com/list.m3u8,"
+    /// 初始播源列表
     #[serde(default)]
-    pub initial_sources: Option<String>,
+    pub sources: Vec<SourceConfig>,
 }
 
 fn default_db_path() -> String {
@@ -29,10 +37,10 @@ fn default_host() -> String {
     "0.0.0.0".to_string()
 }
 fn default_port() -> u16 {
-    5000
+    5001
 }
 fn default_scrape_interval_secs() -> u64 {
-    3600 // 每小时爬取一次
+    3600
 }
 fn default_verify_timeout_secs() -> u64 {
     10
@@ -54,14 +62,37 @@ impl Default for Config {
             verify_timeout_secs: default_verify_timeout_secs(),
             request_timeout_secs: default_request_timeout_secs(),
             verify_concurrency: default_verify_concurrency(),
-            initial_sources: None,
+            sources: Vec::new(),
         }
     }
 }
 
 impl Config {
-    pub fn from_env_or_default() -> Self {
-        let mut config = Self::default();
+    /// 从配置文件加载，文件不存在时使用默认值
+    pub fn from_file_or_default() -> Self {
+        let config_path =
+            std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
+
+        let mut config = match std::fs::read_to_string(&config_path) {
+            Ok(content) => {
+                match toml::from_str::<Config>(&content) {
+                    Ok(c) => {
+                        tracing::info!("已加载配置文件: {}", config_path);
+                        c
+                    }
+                    Err(e) => {
+                        tracing::warn!("配置文件解析失败 ({}): {}, 使用默认配置", config_path, e);
+                        Config::default()
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::info!("未找到配置文件 ({}), 使用默认配置", config_path);
+                Config::default()
+            }
+        };
+
+        // 环境变量覆盖（便于容器化部署和临时调整）
         if let Ok(db) = std::env::var("DB_PATH") {
             config.db_path = db;
         }
@@ -93,30 +124,44 @@ impl Config {
                 config.verify_concurrency = v;
             }
         }
-        if let Ok(sources) = std::env::var("INITIAL_SOURCES") {
-            config.initial_sources = Some(sources);
+        // 兼容旧 INITIAL_SOURCES 环境变量（分号分隔格式）
+        if let Ok(raw) = std::env::var("INITIAL_SOURCES") {
+            let parsed = Self::parse_legacy_sources(&raw);
+            if !parsed.is_empty() {
+                config.sources = parsed;
+            }
         }
+
         config
     }
 
-    /// 解析 INITIAL_SOURCES 为 (name, url, category) 三元组列表
-    pub fn parse_initial_sources(&self) -> Vec<(String, String, Option<String>)> {
+    /// 旧格式兼容: "name,url,category;name2,url2,cat2"
+    fn parse_legacy_sources(raw: &str) -> Vec<SourceConfig> {
         let mut result = Vec::new();
-        if let Some(ref raw) = self.initial_sources {
-            for part in raw.split(';') {
-                let part = part.trim();
-                if part.is_empty() {
-                    continue;
-                }
-                let fields: Vec<&str> = part.splitn(3, ',').collect();
-                let name = fields.first().map(|s| s.trim().to_string()).unwrap_or_default();
-                let url = fields.get(1).map(|s| s.trim().to_string()).unwrap_or_default();
-                let category = fields.get(2).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-                if !name.is_empty() && !url.is_empty() {
-                    result.push((name, url, category));
-                }
+        for part in raw.split(';') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = part.splitn(3, ',').collect();
+            let name = fields.first().map(|s| s.trim().to_string()).unwrap_or_default();
+            let url = fields.get(1).map(|s| s.trim().to_string()).unwrap_or_default();
+            let category = fields
+                .get(2)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if !name.is_empty() && !url.is_empty() {
+                result.push(SourceConfig { name, url, category });
             }
         }
         result
+    }
+
+    /// 转为 db::ensure_playlist_sources 接受的格式
+    pub fn parse_initial_sources(&self) -> Vec<(String, String, Option<String>)> {
+        self.sources
+            .iter()
+            .map(|s| (s.name.clone(), s.url.clone(), s.category.clone()))
+            .collect()
     }
 }

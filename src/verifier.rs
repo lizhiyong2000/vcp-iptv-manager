@@ -28,7 +28,7 @@ impl Verifier {
     /// 验证所有待验证的播放地址
     pub async fn verify_unchecked(&self) -> Result<VerificationResult> {
         info!("开始验证播放地址可用性...");
-        let items = self.db.get_unverified_items(self.config.verify_concurrency * 5)?;
+        let items = self.db.get_unverified_items()?;
 
         if items.is_empty() {
             info!("没有需要验证的播放地址");

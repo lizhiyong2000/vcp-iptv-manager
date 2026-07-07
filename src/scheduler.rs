@@ -114,11 +114,23 @@ async fn run_scrape_cycle(db: Arc<Database>, client: reqwest::Client) {
                         Ok(items) => {
                             let count = items.len() as i32;
                             if !items.is_empty() {
+                                // 收集本次拉取的所有 URL
+                                let fresh_urls: Vec<String> = items.iter().map(|i| i.url.clone()).collect();
                                 match db.upsert_play_items(&items) {
-                                    Ok(n) => info!(
-                                        "播源 [{}]: 解析 {} 个频道, 新增/更新 {} 个",
-                                        source_name, count, n
-                                    ),
+                                    Ok(n) => {
+                                        info!(
+                                            "播源 [{}]: 解析 {} 个频道, 新增/更新 {} 个",
+                                            source_name, count, n
+                                        );
+                                        // 清理已不在播源中的过期条目
+                                        match db.cleanup_stale_items(&source_name, &fresh_urls) {
+                                            Ok(d) if d > 0 => {
+                                                info!("播源 [{}]: 清理 {} 条过期播放地址", source_name, d);
+                                            }
+                                            Err(e) => warn!("播源 [{}]: 清理过期条目失败: {}", source_name, e),
+                                            _ => {}
+                                        }
+                                    }
                                     Err(e) => error!("播源 [{}]: 保存失败: {}", source_name, e),
                                 }
                             }

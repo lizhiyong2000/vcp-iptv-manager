@@ -192,6 +192,7 @@ impl Database {
     }
 
     /// 批量插入播放地址
+    /// 已存在的条目会重置验证状态，以便重新验证
     pub fn upsert_play_items(&self, items: &[RawPlayItem]) -> Result<usize> {
         let mut count = 0;
         let conn = self.conn.lock().unwrap();
@@ -205,6 +206,9 @@ impl Database {
                     source      = ?3,
                     category    = COALESCE(?4, category),
                     resolution  = COALESCE(?5, resolution),
+                    is_valid    = 0,
+                    fail_count  = 0,
+                    last_checked = NULL,
                     updated_at  = CURRENT_TIMESTAMP",
                 params![
                     item.channel_name,
@@ -245,8 +249,35 @@ impl Database {
         Ok(())
     }
 
-    /// 获取需要验证的播放地址
-    pub fn get_unverified_items(&self, limit: usize) -> Result<Vec<PlayItem>> {
+    /// 清理播源中已失效的播放地址（URL 不在最新拉取列表中）
+    pub fn cleanup_stale_items(&self, source: &str, fresh_urls: &[String]) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        if fresh_urls.is_empty() {
+            return Ok(0);
+        }
+        // 构建 NOT IN 占位符（从 ?2 开始，?1 已用于 source）
+        let placeholders: Vec<String> = fresh_urls
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 2))
+            .collect();
+        let sql = format!(
+            "DELETE FROM play_items WHERE source = ?1 AND url NOT IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        params.push(Box::new(source.to_string()));
+        for url in fresh_urls {
+            params.push(Box::new(url.clone()));
+        }
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|v| v.as_ref()).collect();
+        let deleted = stmt.execute(params_ref.as_slice())?;
+        Ok(deleted)
+    }
+
+    /// 获取全部需要验证的播放地址
+    pub fn get_unverified_items(&self) -> Result<Vec<PlayItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, channel_name, url, source, category, is_valid, fail_count,
@@ -254,11 +285,10 @@ impl Database {
              FROM play_items
              WHERE last_checked IS NULL
                 OR last_checked < datetime('now', '-1 hours')
-             ORDER BY last_checked IS NULL DESC, last_checked ASC
-             LIMIT ?1",
+             ORDER BY last_checked IS NULL DESC, last_checked ASC",
         )?;
         let items = stmt
-            .query_map(params![limit as i32], |row| {
+            .query_map([], |row| {
                 Ok(PlayItem {
                     id: row.get(0)?,
                     channel_name: row.get(1)?,

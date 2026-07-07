@@ -26,43 +26,68 @@ cargo build --release
 ### 运行
 
 ```bash
-# 使用默认配置
+# 方式一：使用配置文件（推荐）
+cp config.example.toml config.toml   # 首次使用需复制模板
+# 编辑 config.toml 中的播源和端口等配置
 cargo run --release
 
-# 带初始播源启动（推荐）
-INITIAL_SOURCES="my-tv,https://live.zbds.top/tv/iptv4.m3u,综合" \
+# 方式二：纯默认配置（无初始播源）
 cargo run --release
 
-# 完整自定义配置
-PORT=5000 SCRAPE_INTERVAL_SECS=7200 \
-INITIAL_SOURCES="src1,https://example.com/tv.m3u,综合;src2,https://other.com/list.m3u8,体育" \
-cargo run --release
+# 方式三：环境变量覆盖配置文件中的部分字段
+PORT=5001 SCRAPE_INTERVAL_SECS=7200 cargo run --release
 ```
 
-### 配置项
+### 配置文件
 
-| 环境变量 | 默认值 | 说明 |
-|---------|--------|------|
-| `DB_PATH` | `data/iptv.db` | SQLite 数据库路径 |
-| `HOST` | `0.0.0.0` | HTTP 监听地址 |
-| `PORT` | `5000` | HTTP 端口 |
-| `SCRAPE_INTERVAL_SECS` | `3600` | 播源拉取间隔（秒） |
-| `VERIFY_TIMEOUT_SECS` | `10` | 流地址验证超时（秒） |
-| `REQUEST_TIMEOUT_SECS` | `30` | HTTP 请求超时（秒） |
-| `VERIFY_CONCURRENCY` | `20` | 验证并发数 |
-| `INITIAL_SOURCES` | (空) | 初始播源，格式见下方 |
+配置优先级：**配置文件 `config.toml` → 环境变量覆盖**
 
-### 初始播源格式
-
-```
-INITIAL_SOURCES="名称,URL,分类"
+首次使用请复制模板：
+```bash
+cp config.example.toml config.toml
 ```
 
-多个播源用 `;` 分隔，启动时自动注入数据库（已存在的 URL 自动跳过）。
+配置模板 `config.example.toml`：
 
+```toml
+# 数据库路径
+db_path = "data/iptv.db"
+
+# HTTP 监听地址和端口
+host = "0.0.0.0"
+port = 5001
+
+# 播源拉取间隔（秒）
+scrape_interval_secs = 3600
+
+# 流地址验证超时（秒）
+verify_timeout_secs = 10
+
+# HTTP 请求超时（秒）
+request_timeout_secs = 30
+
+# 验证并发数
+verify_concurrency = 20
+
+# 初始播源列表（启动时自动注入数据库，已存在的跳过）
+[[sources]]
+name = "zbds-iptv4"
+url = "https://live.zbds.top/tv/iptv4.m3u"
+category = "综合"
 ```
-INITIAL_SOURCES="源1,https://example.com/tv.m3u,综合;源2,https://other.com/list.m3u8,体育"
-```
+
+### 环境变量覆盖
+
+| 环境变量 | 对应配置项 | 示例 |
+|---------|-----------|------|
+| `CONFIG_PATH` | 配置文件路径 | `my-config.toml` |
+| `PORT` | 端口 | `5001` |
+| `DB_PATH` | 数据库路径 | `/data/iptv.db` |
+| `SCRAPE_INTERVAL_SECS` | 拉取间隔 | `7200` |
+| `VERIFY_TIMEOUT_SECS` | 验证超时 | `15` |
+| `REQUEST_TIMEOUT_SECS` | 请求超时 | `60` |
+| `VERIFY_CONCURRENCY` | 验证并发数 | `30` |
+| `INITIAL_SOURCES` | 旧格式播源（兼容） | `name,url,cat;...` |
 
 > **提示**: 可在 GitHub 或社区搜索公开的 IPTV M3U 播放列表，将 URL 作为播源添加。
 
@@ -178,7 +203,7 @@ curl http://localhost:5000/api/playitems/m3u8
 ```
                       ┌──────────────────┐
     启动时注入 ──────→│ playlist_sources  │←───── API 动态管理
-  (INITIAL_SOURCES)   │   (播源注册表)     │     (添加/删除/启禁)
+  (config.toml 播源)   │   (播源注册表)     │     (添加/删除/启禁)
                       └────────┬─────────┘
                                │ 定时 cron 拉取
                                ▼
@@ -211,6 +236,7 @@ curl http://localhost:5000/api/playitems/m3u8
 
 ```
 ├── Cargo.toml            # 项目依赖 (Axum, reqwest, rusqlite, tokio...)
+├── config.example.toml   # 配置文件模板（复制为 config.toml 使用）
 ├── README.md
 └── src/
     ├── main.rs           # 入口：初始化 → 调度器 → HTTP 服务
@@ -238,6 +264,6 @@ curl http://localhost:5000/api/playitems/m3u8
 - **调度器**: [tokio-cron-scheduler 0.13](https://github.com/mvniekerk/tokio-cron-scheduler)
 - **异步运行时**: [Tokio](https://tokio.rs)
 - **日志**: [tracing](https://github.com/tokio-rs/tracing)
-- **序列化**: [serde](https://serde.rs) / serde_json
+- **序列化**: [serde](https://serde.rs) / serde_json / toml
 - **HTML 解析**: [scraper](https://crates.io/crates/scraper)
 - **URL 解析**: [url](https://crates.io/crates/url)
