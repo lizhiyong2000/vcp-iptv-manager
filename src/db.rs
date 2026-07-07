@@ -21,6 +21,7 @@ impl Database {
             conn: Mutex::new(conn),
         };
         db.init_tables()?;
+        db.migrate_channels()?;
         info!("数据库初始化完成: {}", db_path);
         Ok(db)
     }
@@ -75,6 +76,25 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_channels_source    ON channels(source);
             ",
         )?;
+        Ok(())
+    }
+
+    /// 迁移：从 play_items 同步频道到 channels 表（仅当 channels 为空时）
+    fn migrate_channels(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let channel_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM channels", [], |r| r.get(0))?;
+        if channel_count > 0 {
+            return Ok(());
+        }
+        let affected = conn.execute(
+            "INSERT OR IGNORE INTO channels (name, source, category)
+             SELECT DISTINCT channel_name, source, category FROM play_items",
+            [],
+        )?;
+        if affected > 0 {
+            info!("数据迁移: 从 play_items 同步 {} 个频道到 channels 表", affected);
+        }
         Ok(())
     }
 
@@ -167,6 +187,74 @@ impl Database {
         Ok((items, total))
     }
 
+    /// 根据 ID 查询频道
+    pub fn get_channel(&self, id: i64) -> Result<Option<Channel>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, source, category, logo_url, created_at, updated_at
+             FROM channels WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(Channel {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                source: row.get(2)?,
+                category: row.get(3)?,
+                logo_url: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// 查询某频道的播放地址列表（按 channel_name + source 匹配）
+    pub fn get_channel_playitems(
+        &self,
+        channel_name: &str,
+        source: &str,
+        page_num: i32,
+        page_size: i32,
+    ) -> Result<(Vec<PlayItem>, i64)> {
+        let conn = self.conn.lock().unwrap();
+
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM play_items WHERE channel_name = ?1 AND source = ?2",
+            params![channel_name, source],
+            |r| r.get(0),
+        )?;
+
+        let offset = ((page_num - 1) * page_size).max(0);
+        let mut stmt = conn.prepare(
+            "SELECT id, channel_name, url, source, category, is_valid, fail_count,
+                    last_checked, resolution, bitrate, created_at, updated_at
+             FROM play_items
+             WHERE channel_name = ?1 AND source = ?2
+             ORDER BY is_valid DESC, id DESC
+             LIMIT ?3 OFFSET ?4",
+        )?;
+        let items = stmt
+            .query_map(params![channel_name, source, page_size, offset], |row| {
+                Ok(PlayItem {
+                    id: row.get(0)?,
+                    channel_name: row.get(1)?,
+                    url: row.get(2)?,
+                    source: row.get(3)?,
+                    category: row.get(4)?,
+                    is_valid: row.get(5)?,
+                    fail_count: row.get(6)?,
+                    last_checked: row.get(7)?,
+                    resolution: row.get(8)?,
+                    bitrate: row.get(9)?,
+                    created_at: row.get(10)?,
+                    updated_at: row.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok((items, total))
+    }
+
     // ---- 播放地址操作 ----
 
     pub fn upsert_play_item(&self, item: &RawPlayItem) -> Result<bool> {
@@ -221,6 +309,15 @@ impl Database {
             if affected > 0 {
                 count += 1;
             }
+            // 同步写入 channels 表（按 name+source 去重）
+            let _ = conn.execute(
+                "INSERT INTO channels (name, source, category)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(name, source) DO UPDATE SET
+                    category   = COALESCE(?3, category),
+                    updated_at = CURRENT_TIMESTAMP",
+                params![item.channel_name, item.source, item.category],
+            );
         }
         conn.execute("COMMIT", [])?;
         Ok(count)

@@ -26,6 +26,10 @@ pub fn build_router() -> Router<Arc<AppState>> {
             "/api/channels/sources",
             axum::routing::get(channels::list_channel_sources),
         )
+        .route(
+            "/api/channels/{id}/playitems",
+            axum::routing::get(channels::get_channel_playitems),
+        )
         // 统计
         .route("/api/stats", axum::routing::get(playitems::get_stats))
         // 手动触发爬取+验证
