@@ -123,13 +123,21 @@ impl M3uPlaylistFetcher {
                     if !next_line.is_empty() && !next_line.starts_with('#') {
                         let resolved_url =
                             self.resolve_url(&self.playlist_url, next_line);
-                        items.push(RawPlayItem {
-                            channel_name: channel_name.clone(),
-                            url: resolved_url,
-                            source: self.source_name.clone(),
-                            category: category.or_else(|| self.category.clone()),
-                            resolution: resolution.clone(),
-                        });
+                        // 只保留 HLS 流地址（http/https），丢弃 rtp/rtsp/udp 等非 HLS 协议
+                        if Self::is_hls_url(&resolved_url) {
+                            items.push(RawPlayItem {
+                                channel_name: channel_name.clone(),
+                                url: resolved_url,
+                                source: self.source_name.clone(),
+                                category: category.or_else(|| self.category.clone()),
+                                resolution: resolution.clone(),
+                            });
+                        } else {
+                            debug!(
+                                "[{}] 丢弃非 HLS 地址: {} -> {}",
+                                self.source_name, channel_name, resolved_url
+                            );
+                        }
 
                         // 同时记录 logo（存到 resolution 字段后面的实际使用有待扩展）
                         // 此处 logo_url 如有需要在后续扩展
@@ -342,6 +350,11 @@ impl M3uPlaylistFetcher {
         }
     }
 
+    /// 判断是否为有效 HLS 播放地址（仅 http/https）
+    fn is_hls_url(url: &str) -> bool {
+        url.starts_with("http://") || url.starts_with("https://")
+    }
+
     /// 相对 URL 转为绝对 URL
     fn resolve_url(&self, base: &str, relative: &str) -> String {
         let relative = relative.trim();
@@ -448,7 +461,7 @@ mod tests {
         // ============ 3. 获取待验证的地址并逐个验证 ============
         println!("\n🔍 开始验证流地址可用性... (并发: 20)");
 
-        let unverified = match db.get_unverified_items(10000) {
+        let unverified = match db.get_unverified_items() {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("❌ 查询待验证项失败: {}", e);

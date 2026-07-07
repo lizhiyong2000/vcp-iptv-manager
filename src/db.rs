@@ -6,6 +6,102 @@ use tracing::info;
 
 use crate::models::{Channel, PlayItem, PlaylistSource, RawPlayItem, SourceStats, Stats};
 
+/// 标准化频道名称，用于合并同名但写法不同的频道
+///
+/// 例如: "CCTV-1 综合" → "cctv1", "CCTV1" → "cctv1", "湖南卫视HD" → "湖南卫视"
+fn normalize_channel_name(name: &str) -> String {
+    let mut result = name.trim().to_lowercase();
+
+    // 移除括号内容: [xxx], (xxx), 【xxx】, （xxx）
+    result = remove_bracketed(&result);
+
+    // 常见描述性后缀（频道号/名称本身足以区分，后缀只是描述）
+    let suffixes = [
+        // 中文
+        "综合", "财经", "综艺", "体育", "电影", "电视剧", "纪录", "纪录片",
+        "科教", "戏曲", "音乐", "新闻", "少儿", "农业", "军事", "法制",
+        "社会与法", "探索", "发现", "中文国际", "英文国际", "国际",
+        "高清", "标清", "超清", "蓝光", "原画",
+        // 英文
+        "hd", "sd", "fhd", "uhd", "4k", "8k", "h265", "hevc", "h264", "avc",
+        "hdr", "dolby",
+    ];
+
+    for suffix in &suffixes {
+        result = result.trim().to_string();
+        if result.ends_with(suffix) {
+            result = result[..result.len() - suffix.len()].to_string();
+        }
+    }
+
+    // 移除分隔符：空格、连字符、下划线、中间点
+    result = result
+        .replace(' ', "")
+        .replace('-', "")
+        .replace('_', "")
+        .replace('·', "")
+        .replace('•', "");
+
+    // 第二次移除括号（可能在去除空格后暴露出新的括号内容）
+    result = remove_bracketed(&result);
+
+    result.trim().to_string()
+}
+
+/// 移除字符串中的括号内容：[...], (...), 【...】, （...）
+fn remove_bracketed(s: &str) -> String {
+    let mut result = String::new();
+    let mut depth = 0u32;
+    for ch in s.chars() {
+        match ch {
+            '[' | '（' => depth += 1,
+            '(' | '【' => depth += 1,
+            ']' | '）' => {
+                if depth > 0 { depth -= 1; }
+            }
+            ')' | '】' => {
+                if depth > 0 { depth -= 1; }
+            }
+            _ => {
+                if depth == 0 {
+                    result.push(ch);
+                }
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_cctv() {
+        assert_eq!(normalize_channel_name("CCTV-1 综合"), "cctv1");
+        assert_eq!(normalize_channel_name("CCTV1"), "cctv1");
+        assert_eq!(normalize_channel_name("CCTV-1"), "cctv1");
+        assert_eq!(normalize_channel_name("CCTV-1 高清"), "cctv1");
+        assert_eq!(normalize_channel_name("CCTV1 综合"), "cctv1");
+        assert_eq!(normalize_channel_name("CCTV-2 财经"), "cctv2");
+        assert_eq!(normalize_channel_name("CCTV-5+ 体育"), "cctv5+");
+    }
+
+    #[test]
+    fn test_normalize_hd() {
+        assert_eq!(normalize_channel_name("湖南卫视HD"), "湖南卫视");
+        assert_eq!(normalize_channel_name("湖南卫视高清"), "湖南卫视");
+        assert_eq!(normalize_channel_name("湖南卫视"), "湖南卫视");
+    }
+
+    #[test]
+    fn test_normalize_brackets() {
+        assert_eq!(normalize_channel_name("CCTV-1(高清)"), "cctv1");
+        assert_eq!(normalize_channel_name("CCTV1 [HD]"), "cctv1");
+        assert_eq!(normalize_channel_name("湖南卫视(HD)"), "湖南卫视");
+    }
+}
+
 pub struct Database {
     conn: Mutex<Connection>,
 }
@@ -31,14 +127,14 @@ impl Database {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS channels (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                name        TEXT    NOT NULL,
-                source      TEXT    NOT NULL,
-                category    TEXT,
-                logo_url    TEXT,
-                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(name, source)
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT    NOT NULL,
+                normalized_name TEXT    NOT NULL UNIQUE,
+                source          TEXT    NOT NULL,
+                category        TEXT,
+                logo_url        TEXT,
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS play_items (
@@ -73,27 +169,139 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_play_items_channel ON play_items(channel_name);
             CREATE INDEX IF NOT EXISTS idx_play_items_source  ON play_items(source);
             CREATE INDEX IF NOT EXISTS idx_play_items_valid   ON play_items(is_valid);
-            CREATE INDEX IF NOT EXISTS idx_channels_source    ON channels(source);
             ",
         )?;
         Ok(())
     }
 
-    /// 迁移：从 play_items 同步频道到 channels 表（仅当 channels 为空时）
+    /// 迁移：合并同名 channel 并同步数据
+    ///   - v0→v2: channels 唯一键从 (name,source) 改为 (name)，同名合并
+    ///   - v2→v3: 增加 normalized_name 列，模糊匹配合并相似频道名
     fn migrate_channels(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let channel_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM channels", [], |r| r.get(0))?;
-        if channel_count > 0 {
-            return Ok(());
+
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+
+        if version < 2 {
+            info!("检测到旧版 schema (v{})，开始迁移 v0→v2...", version);
+
+            conn.execute_batch(
+                "
+                DROP TABLE IF EXISTS channels_new;
+
+                CREATE TABLE channels_new (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT    NOT NULL UNIQUE,
+                    source      TEXT    NOT NULL,
+                    category    TEXT,
+                    logo_url    TEXT,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                INSERT OR IGNORE INTO channels_new (name, source, category, logo_url, created_at, updated_at)
+                SELECT name, source, category, logo_url, created_at, updated_at
+                FROM (
+                    SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) as rn
+                    FROM channels
+                ) WHERE rn = 1;
+
+                DROP TABLE channels;
+                ALTER TABLE channels_new RENAME TO channels;
+
+                -- 如果 channels 为空，从 play_items 重建
+                INSERT OR IGNORE INTO channels (name, source, category)
+                SELECT channel_name, MIN(source), category
+                FROM play_items
+                WHERE (SELECT COUNT(*) FROM channels) = 0
+                GROUP BY channel_name;
+                ",
+            )?;
+
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM channels", [], |r| r.get(0))?;
+            conn.pragma_update(None, "user_version", 2)?;
+            info!("迁移 v0→v2 完成: {} 个频道已合并", count);
         }
-        let affected = conn.execute(
-            "INSERT OR IGNORE INTO channels (name, source, category)
-             SELECT DISTINCT channel_name, source, category FROM play_items",
-            [],
-        )?;
-        if affected > 0 {
-            info!("数据迁移: 从 play_items 同步 {} 个频道到 channels 表", affected);
+
+        // v2→v3: 添加 normalized_name 列，按标准化名称合并相似频道
+        if version < 3 {
+            info!("开始迁移 v2→v3: 标准化频道名称合并...");
+
+            // 1. 读取所有现有频道
+            let mut stmt = conn.prepare("SELECT id, name FROM channels ORDER BY id")?;
+            let channels: Vec<(i64, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // 2. 计算标准化名称，找出重复组
+            use std::collections::HashMap;
+            let mut norm_map: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+            for (id, name) in &channels {
+                let norm = normalize_channel_name(name);
+                norm_map.entry(norm).or_default().push((*id, name.clone()));
+            }
+
+            // 3. 删除重复频道（保留 id 最小的）
+            let mut deleted_count = 0;
+            for (_norm, group) in norm_map.iter() {
+                if group.len() > 1 {
+                    // 按 id 排序，保留第一个，删除其余
+                    let mut sorted = group.clone();
+                    sorted.sort_by_key(|(id, _)| *id);
+                    for (id, name) in &sorted[1..] {
+                        conn.execute("DELETE FROM channels WHERE id = ?1", params![id])?;
+                        deleted_count += 1;
+                        info!("  合并频道: 删除重复 '{}' (id={})", name, id);
+                    }
+                }
+            }
+
+            // 4. 重建 channels 表以添加 normalized_name 列
+            //    注意：先不加 UNIQUE 约束，填充完标准化名称后再加唯一索引
+            conn.execute_batch(
+                "
+                DROP TABLE IF EXISTS channels_v3;
+
+                CREATE TABLE channels_v3 (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name            TEXT    NOT NULL,
+                    normalized_name TEXT    NOT NULL,
+                    source          TEXT    NOT NULL,
+                    category        TEXT,
+                    logo_url        TEXT,
+                    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                INSERT INTO channels_v3 (id, name, normalized_name, source, category, logo_url, created_at, updated_at)
+                SELECT id, name, '', source, category, logo_url, created_at, updated_at
+                FROM channels;
+
+                DROP TABLE channels;
+                ALTER TABLE channels_v3 RENAME TO channels;
+                ",
+            )?;
+
+            // 5. 填充 normalized_name（用 Rust 计算）
+            let mut update_stmt = conn.prepare("UPDATE channels SET normalized_name = ?1 WHERE id = ?2")?;
+            for (id, name) in &channels {
+                let norm = normalize_channel_name(name);
+                // 跳过已被删除的
+                update_stmt.execute(params![norm, id]).ok();
+            }
+
+            // 6. 填充完成后添加唯一索引
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_normalized ON channels(normalized_name)",
+                [],
+            )?;
+
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM channels", [], |r| r.get(0))?;
+            conn.pragma_update(None, "user_version", 3)?;
+            info!(
+                "迁移 v2→v3 完成: {} 个频道（合并删除 {} 个重复频道）",
+                count, deleted_count
+            );
         }
         Ok(())
     }
@@ -108,14 +316,15 @@ impl Database {
         logo_url: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        let normalized = normalize_channel_name(name);
         conn.execute(
-            "INSERT INTO channels (name, source, category, logo_url)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(name, source) DO UPDATE SET
-                category = COALESCE(?3, category),
-                logo_url = COALESCE(?4, logo_url),
+            "INSERT INTO channels (name, normalized_name, source, category, logo_url)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(normalized_name) DO UPDATE SET
+                category = COALESCE(?4, category),
+                logo_url = COALESCE(?5, logo_url),
                 updated_at = CURRENT_TIMESTAMP",
-            params![name, source, category, logo_url],
+            params![name, normalized, source, category, logo_url],
         )?;
         Ok(())
     }
@@ -142,7 +351,11 @@ impl Database {
             bind_values.push(Box::new(format!("%{}%", kw)));
         }
         if let Some(src) = source {
-            conditions.push(format!("source = ?{}", bind_values.len() + 1));
+            // 合并后 channel.source 是首次发现源，需通过 play_items 表匹配实际来源
+            conditions.push(format!(
+                "name IN (SELECT DISTINCT channel_name FROM play_items WHERE source = ?{})",
+                bind_values.len() + 1
+            ));
             bind_values.push(Box::new(src.to_string()));
         }
 
@@ -208,33 +421,37 @@ impl Database {
         Ok(rows.next().transpose()?)
     }
 
-    /// 查询某频道的播放地址列表（按 channel_name + source 匹配）
+    /// 查询某频道的播放地址列表（通过 normalized_name 关联，返回所有名称变体的播放地址）
     pub fn get_channel_playitems(
         &self,
         channel_name: &str,
-        source: &str,
         page_num: i32,
         page_size: i32,
     ) -> Result<(Vec<PlayItem>, i64)> {
         let conn = self.conn.lock().unwrap();
+        let normalized = normalize_channel_name(channel_name);
 
         let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM play_items WHERE channel_name = ?1 AND source = ?2",
-            params![channel_name, source],
+            "SELECT COUNT(*) FROM play_items pi
+             INNER JOIN channels c ON pi.channel_name = c.name
+             WHERE c.normalized_name = ?1",
+            params![normalized],
             |r| r.get(0),
         )?;
 
         let offset = ((page_num - 1) * page_size).max(0);
         let mut stmt = conn.prepare(
-            "SELECT id, channel_name, url, source, category, is_valid, fail_count,
-                    last_checked, resolution, bitrate, created_at, updated_at
-             FROM play_items
-             WHERE channel_name = ?1 AND source = ?2
-             ORDER BY is_valid DESC, id DESC
-             LIMIT ?3 OFFSET ?4",
+            "SELECT pi.id, pi.channel_name, pi.url, pi.source, pi.category,
+                    pi.is_valid, pi.fail_count, pi.last_checked, pi.resolution, pi.bitrate,
+                    pi.created_at, pi.updated_at
+             FROM play_items pi
+             INNER JOIN channels c ON pi.channel_name = c.name
+             WHERE c.normalized_name = ?1
+             ORDER BY pi.is_valid DESC, pi.source, pi.id DESC
+             LIMIT ?2 OFFSET ?3",
         )?;
         let items = stmt
-            .query_map(params![channel_name, source, page_size, offset], |row| {
+            .query_map(params![normalized, page_size, offset], |row| {
                 Ok(PlayItem {
                     id: row.get(0)?,
                     channel_name: row.get(1)?,
@@ -309,14 +526,15 @@ impl Database {
             if affected > 0 {
                 count += 1;
             }
-            // 同步写入 channels 表（按 name+source 去重）
+            // 同步写入 channels 表（按 normalized_name 去重，合并相似频道名）
+            let normalized = normalize_channel_name(&item.channel_name);
             let _ = conn.execute(
-                "INSERT INTO channels (name, source, category)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(name, source) DO UPDATE SET
-                    category   = COALESCE(?3, category),
+                "INSERT INTO channels (name, normalized_name, source, category)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(normalized_name) DO UPDATE SET
+                    category   = COALESCE(?4, category),
                     updated_at = CURRENT_TIMESTAMP",
-                params![item.channel_name, item.source, item.category],
+                params![item.channel_name, normalized, item.source, item.category],
             );
         }
         conn.execute("COMMIT", [])?;

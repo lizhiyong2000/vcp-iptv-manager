@@ -62,7 +62,7 @@ pub struct ChannelPlayItemQuery {
     pub page_size: i32,
 }
 
-/// 查询某频道下的所有播放地址
+/// 查询某频道下的所有播放地址（返回所有来源的播放地址）
 pub async fn get_channel_playitems(
     State(state): State<Arc<AppState>>,
     Path(channel_id): Path<i64>,
@@ -75,10 +75,9 @@ pub async fn get_channel_playitems(
         Err(e) => return Json(ApiResponse::error(500, format!("查询频道失败: {}", e))),
     };
 
-    // 按 channel_name + source 查询对应播放地址
+    // 按 channel_name 查询所有来源的播放地址（已合并）
     match state.db.get_channel_playitems(
         &channel.name,
-        &channel.source,
         params.page_num.max(1),
         params.page_size.min(200).max(1),
     ) {
