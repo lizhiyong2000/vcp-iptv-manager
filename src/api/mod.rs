@@ -1,5 +1,7 @@
 pub mod channels;
 pub mod playitems;
+pub mod pull;
+pub mod pull_tasks;
 pub mod pull_validate;
 pub mod sources;
 
@@ -52,9 +54,34 @@ pub fn build_router() -> Router<Arc<AppState>> {
             "/api/sources/{id}/fetch",
             axum::routing::post(sources::fetch_source_now),
         )
-        // 拉流验证（批量提交 RTMP/RTSP 拉流任务到 media-manager）
+        // 拉流验证任务中心
+        .route("/api/pull/tasks", axum::routing::post(pull_tasks::create_pull_tasks))
+        .route("/api/pull/tasks", axum::routing::get(pull_tasks::list_pull_tasks))
+        .route(
+            "/api/pull/tasks/{id}",
+            axum::routing::get(pull_tasks::get_pull_task),
+        )
+        .route(
+            "/api/pull/tasks/{id}/stop",
+            axum::routing::post(pull_tasks::stop_pull_task),
+        )
+        .route(
+            "/api/pull/tasks/{id}/retry",
+            axum::routing::post(pull_tasks::retry_pull_task),
+        )
+        // 拉流代理（直连 vcp-media-server）
+        .route("/api/pull/rtmp", axum::routing::post(pull::pull_rtmp))
+        .route("/api/pull/rtsp", axum::routing::post(pull::pull_rtsp))
+        .route("/api/pull/hls", axum::routing::post(pull::pull_hls))
+        .route("/api/pull/flv", axum::routing::post(pull::pull_flv))
+        // 拉流验证（批量提交 RTMP/RTSP/HLS/FLV 拉流任务）
         .route(
             "/api/pull/validate",
             axum::routing::post(pull_validate::pull_validate),
+        )
+        // 截图图片代理（直连 vcp-media-server）
+        .route(
+            "/api/snapshot-image/{snapshot_id}",
+            axum::routing::get(pull::get_snapshot_image),
         )
 }

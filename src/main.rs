@@ -7,6 +7,7 @@ use vcp_iptv_manager::config::Config;
 use vcp_iptv_manager::db::Database;
 use vcp_iptv_manager::scheduler;
 use vcp_iptv_manager::verifier::Verifier;
+use vcp_iptv_manager::task_center::PullTaskCenter;
 use vcp_iptv_manager::AppState;
 
 #[tokio::main]
@@ -47,11 +48,22 @@ async fn main() -> anyhow::Result<()> {
     let verifier = Arc::new(Verifier::new(db.clone(), config.clone()));
 
     // 构建应用状态
+    let task_center = Arc::new(PullTaskCenter::new(
+        db.clone(),
+        client.clone(),
+        config.media_server_url.clone(),
+    ));
+    if let Err(err) = task_center.recover_on_startup().await {
+        tracing::warn!("恢复拉流验证任务失败: {err}");
+    }
+    task_center.spawn_dispatcher();
+
     let state = Arc::new(AppState {
         db: db.clone(),
         verifier: verifier.clone(),
         client: client.clone(),
-        media_manager_url: config.media_manager_url.clone(),
+        media_server_url: config.media_server_url.clone(),
+        task_center,
     });
 
     // 启动定时任务调度器（M3U 播源拉取 + 验证）

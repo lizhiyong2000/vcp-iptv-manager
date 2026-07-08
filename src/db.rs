@@ -1,10 +1,10 @@
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 use tracing::info;
 
-use crate::models::{Channel, PlayItem, PlaylistSource, RawPlayItem, SourceStats, Stats};
+use crate::models::{Channel, CreatePullTaskRequest, PlayItem, PlaylistSource, PullTask, RawPlayItem, SourceStats, Stats};
 
 /// 标准化频道名称，用于合并同名但写法不同的频道
 ///
@@ -70,6 +70,61 @@ fn remove_bracketed(s: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod pull_task_tests {
+    use super::*;
+    use crate::models::CreatePullTaskRequest;
+
+    fn sample_request(stream_id: &str, play_item_id: i64) -> CreatePullTaskRequest {
+        CreatePullTaskRequest {
+            url: "http://example.com/live.m3u8".to_string(),
+            stream_id: stream_id.to_string(),
+            protocol: Some("hls".to_string()),
+            channel_name: Some("测试频道".to_string()),
+            play_item_id: Some(play_item_id),
+        }
+    }
+
+    #[test]
+    fn create_pull_task_deduplicates_active_stream() {
+        let db = Database::new(":memory:").expect("open db");
+        let req = sample_request("CCTV4K_3654", 3654);
+
+        let first = db
+            .create_pull_task(&req, "hls")
+            .expect("create first task");
+        let second = db
+            .create_pull_task(&req, "hls")
+            .expect("dedupe second task");
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            db.find_active_pull_task("CCTV4K_3654", Some(3654))
+                .expect("query")
+                .map(|task| task.id),
+            Some(first.id)
+        );
+    }
+
+    #[test]
+    fn create_pull_task_allows_new_task_after_completion() {
+        let db = Database::new(":memory:").expect("open db");
+        let req = sample_request("CCTV4K_3654", 3654);
+
+        let first = db
+            .create_pull_task(&req, "hls")
+            .expect("create first task");
+        db.update_pull_task_status(first.id, "failed", Some("timeout"))
+            .expect("mark failed");
+
+        let second = db
+            .create_pull_task(&req, "hls")
+            .expect("create second task");
+
+        assert_ne!(first.id, second.id);
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +224,27 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_play_items_channel ON play_items(channel_name);
             CREATE INDEX IF NOT EXISTS idx_play_items_source  ON play_items(source);
             CREATE INDEX IF NOT EXISTS idx_play_items_valid   ON play_items(is_valid);
+
+            CREATE TABLE IF NOT EXISTS pull_tasks (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_name     TEXT,
+                play_item_id     INTEGER,
+                url              TEXT    NOT NULL,
+                stream_id        TEXT    NOT NULL,
+                protocol         TEXT    NOT NULL,
+                status           TEXT    NOT NULL DEFAULT 'pending',
+                error_message    TEXT,
+                snapshot_id      TEXT,
+                snapshot_status  TEXT,
+                retry_count      INTEGER NOT NULL DEFAULT 0,
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at       TIMESTAMP,
+                completed_at     TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pull_tasks_status ON pull_tasks(status);
+            CREATE INDEX IF NOT EXISTS idx_pull_tasks_stream ON pull_tasks(stream_id);
             ",
         )?;
         Ok(())
@@ -633,7 +709,7 @@ impl Database {
         &self,
         channel: Option<&str>,
         source: Option<&str>,
-        is_valid: Option<bool>,
+        pull_status: Option<&str>,
         keyword: Option<&str>,
         page_num: i32,
         page_size: i32,
@@ -643,28 +719,62 @@ impl Database {
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
         if let Some(ch) = channel {
-            conditions.push(format!("channel_name LIKE ?{}", bind_values.len() + 1));
+            conditions.push(format!("pi.channel_name LIKE ?{}", bind_values.len() + 1));
             bind_values.push(Box::new(format!("%{}%", ch)));
         }
         if let Some(src) = source {
-            conditions.push(format!("source = ?{}", bind_values.len() + 1));
+            conditions.push(format!("pi.source = ?{}", bind_values.len() + 1));
             bind_values.push(Box::new(src.to_string()));
         }
-        if let Some(valid) = is_valid {
-            conditions.push(format!("is_valid = ?{}", bind_values.len() + 1));
-            bind_values.push(Box::new(valid));
+        if let Some(status) = pull_status {
+            match status {
+                "unvalidated" => {
+                    conditions.push("latest_pull.play_item_id IS NULL".to_string());
+                }
+                "running" => {
+                    conditions
+                        .push("latest_pull.status IN ('pending', 'pulling', 'snapshotting')".to_string());
+                }
+                "completed" => {
+                    conditions.push("latest_pull.status = 'completed'".to_string());
+                }
+                "snapshot_ok" => {
+                    conditions.push(
+                        "latest_pull.status = 'completed'
+                         AND latest_pull.snapshot_status = 'completed'
+                         AND latest_pull.snapshot_id IS NOT NULL"
+                            .to_string(),
+                    );
+                }
+                "failed" => {
+                    conditions.push("latest_pull.status IN ('failed', 'stopped')".to_string());
+                }
+                _ => {}
+            }
         }
         if let Some(kw) = keyword {
             conditions.push(format!(
-                "(channel_name LIKE ?{n} OR url LIKE ?{n})",
+                "(pi.channel_name LIKE ?{n} OR pi.url LIKE ?{n})",
                 n = bind_values.len() + 1
             ));
             bind_values.push(Box::new(format!("%{}%", kw)));
         }
 
         let where_clause = conditions.join(" AND ");
+        let from_clause = "play_items pi
+            LEFT JOIN (
+                SELECT play_item_id, status, snapshot_id, snapshot_status
+                FROM pull_tasks
+                WHERE play_item_id IS NOT NULL
+                  AND id IN (
+                      SELECT MAX(id)
+                      FROM pull_tasks
+                      WHERE play_item_id IS NOT NULL
+                      GROUP BY play_item_id
+                  )
+            ) latest_pull ON latest_pull.play_item_id = pi.id";
 
-        let count_sql = format!("SELECT COUNT(*) FROM play_items WHERE {}", where_clause);
+        let count_sql = format!("SELECT COUNT(*) FROM {from_clause} WHERE {where_clause}");
         let total: i64 = {
             let mut stmt = conn.prepare(&count_sql)?;
             let params_ref: Vec<&dyn rusqlite::types::ToSql> =
@@ -674,12 +784,12 @@ impl Database {
 
         let offset = ((page_num - 1) * page_size).max(0);
         let query_sql = format!(
-            "SELECT id, channel_name, url, source, category, is_valid, fail_count,
-                    last_checked, resolution, bitrate, created_at, updated_at
-             FROM play_items WHERE {}
-             ORDER BY is_valid DESC, id DESC
+            "SELECT pi.id, pi.channel_name, pi.url, pi.source, pi.category, pi.is_valid, pi.fail_count,
+                    pi.last_checked, pi.resolution, pi.bitrate, pi.created_at, pi.updated_at
+             FROM {from_clause}
+             WHERE {where_clause}
+             ORDER BY pi.id DESC
              LIMIT ?{} OFFSET ?{}",
-            where_clause,
             bind_values.len() + 1,
             bind_values.len() + 2,
         );
@@ -915,5 +1025,229 @@ impl Database {
             active_sources,
             sources: source_stats,
         })
+    }
+
+    // ---- 拉流验证任务 ----
+
+    fn map_pull_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<PullTask> {
+        Ok(PullTask {
+            id: row.get(0)?,
+            channel_name: row.get(1)?,
+            play_item_id: row.get(2)?,
+            url: row.get(3)?,
+            stream_id: row.get(4)?,
+            protocol: row.get(5)?,
+            status: row.get(6)?,
+            error_message: row.get(7)?,
+            snapshot_id: row.get(8)?,
+            snapshot_status: row.get(9)?,
+            retry_count: row.get(10)?,
+            created_at: row.get(11)?,
+            updated_at: row.get(12)?,
+            started_at: row.get(13)?,
+            completed_at: row.get(14)?,
+        })
+    }
+
+    /// Returns an in-flight task for the same stream or play item, if any.
+    pub fn find_active_pull_task(
+        &self,
+        stream_id: &str,
+        play_item_id: Option<i64>,
+    ) -> Result<Option<PullTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = "SELECT id, channel_name, play_item_id, url, stream_id, protocol, status,
+                          error_message, snapshot_id, snapshot_status, retry_count,
+                          created_at, updated_at, started_at, completed_at
+                   FROM pull_tasks
+                   WHERE status IN ('pending', 'pulling', 'snapshotting')
+                     AND (stream_id = ?1 OR (?2 IS NOT NULL AND play_item_id = ?2))
+                   ORDER BY id ASC
+                   LIMIT 1";
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query(params![stream_id, play_item_id])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(Self::map_pull_task(&row)?));
+        }
+        Ok(None)
+    }
+
+    pub fn create_pull_task(&self, req: &CreatePullTaskRequest, protocol: &str) -> Result<PullTask> {
+        if let Some(existing) = self.find_active_pull_task(&req.stream_id, req.play_item_id)? {
+            info!(
+                "跳过重复拉流任务 stream_id={} play_item_id={:?} existing_task_id={}",
+                req.stream_id, req.play_item_id, existing.id
+            );
+            return Ok(existing);
+        }
+
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO pull_tasks (channel_name, play_item_id, url, stream_id, protocol, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
+            params![
+                req.channel_name,
+                req.play_item_id,
+                req.url,
+                req.stream_id,
+                protocol,
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        drop(conn);
+        self.get_pull_task(id)?
+            .ok_or_else(|| anyhow::anyhow!("failed to load created pull task {id}"))
+    }
+
+    pub fn get_pull_task(&self, id: i64) -> Result<Option<PullTask>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, channel_name, play_item_id, url, stream_id, protocol, status,
+                    error_message, snapshot_id, snapshot_status, retry_count,
+                    created_at, updated_at, started_at, completed_at
+             FROM pull_tasks WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(Self::map_pull_task(&row)?));
+        }
+        Ok(None)
+    }
+
+    pub fn list_pull_tasks(&self, status: Option<&str>, limit: i64) -> Result<Vec<PullTask>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = if status.is_some() {
+            "SELECT id, channel_name, play_item_id, url, stream_id, protocol, status,
+                    error_message, snapshot_id, snapshot_status, retry_count,
+                    created_at, updated_at, started_at, completed_at
+             FROM pull_tasks WHERE status = ?1
+             ORDER BY id DESC LIMIT ?2"
+        } else {
+            "SELECT id, channel_name, play_item_id, url, stream_id, protocol, status,
+                    error_message, snapshot_id, snapshot_status, retry_count,
+                    created_at, updated_at, started_at, completed_at
+             FROM pull_tasks
+             ORDER BY id DESC LIMIT ?1"
+        };
+
+        let mut stmt = conn.prepare(sql)?;
+        let rows = if let Some(status) = status {
+            stmt.query_map(params![status, limit], Self::map_pull_task)?
+        } else {
+            stmt.query_map(params![limit], Self::map_pull_task)?
+        };
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn count_pull_tasks_by_status(&self, statuses: &[&str]) -> Result<i64> {
+        if statuses.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT COUNT(*) FROM pull_tasks WHERE status IN ({placeholders})");
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = statuses
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let count = stmt.query_row(params.as_slice(), |r| r.get(0))?;
+        Ok(count)
+    }
+
+    pub fn claim_next_pending_pull_task(&self) -> Result<Option<PullTask>> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM pull_tasks WHERE status = 'pending' ORDER BY id ASC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        tx.execute(
+            "UPDATE pull_tasks
+             SET status = 'pulling', started_at = COALESCE(started_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND status = 'pending'",
+            params![id],
+        )?;
+        tx.commit()?;
+        drop(conn);
+        self.get_pull_task(id)
+    }
+
+    pub fn update_pull_task_status(
+        &self,
+        id: i64,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let completed = matches!(status, "completed" | "failed" | "stopped");
+        if completed {
+            conn.execute(
+                "UPDATE pull_tasks
+                 SET status = ?1, error_message = ?2, updated_at = CURRENT_TIMESTAMP,
+                     completed_at = CURRENT_TIMESTAMP
+                 WHERE id = ?3",
+                params![status, error_message, id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE pull_tasks
+                 SET status = ?1, error_message = ?2, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?3",
+                params![status, error_message, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn update_pull_task_snapshot(
+        &self,
+        id: i64,
+        snapshot_id: &str,
+        snapshot_status: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE pull_tasks
+             SET snapshot_id = ?1, snapshot_status = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?3",
+            params![snapshot_id, snapshot_status, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn reset_pull_task_for_retry(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE pull_tasks
+             SET status = 'pending', error_message = NULL, snapshot_id = NULL, snapshot_status = NULL,
+                 started_at = NULL, completed_at = NULL, retry_count = retry_count + 1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND status IN ('failed', 'stopped', 'completed')",
+            params![id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn recover_interrupted_pull_tasks(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE pull_tasks
+             SET status = 'pending', updated_at = CURRENT_TIMESTAMP
+             WHERE status IN ('pulling', 'snapshotting')",
+            [],
+        )?;
+        Ok(updated)
     }
 }

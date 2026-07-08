@@ -123,6 +123,46 @@ pub struct SourceStats {
     pub valid: i64,
 }
 
+/// 拉流验证任务
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullTask {
+    pub id: i64,
+    pub channel_name: Option<String>,
+    pub play_item_id: Option<i64>,
+    pub url: String,
+    pub stream_id: String,
+    pub protocol: String,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub snapshot_id: Option<String>,
+    pub snapshot_status: Option<String>,
+    pub retry_count: i32,
+    #[serde(serialize_with = "serialize_dt_local")]
+    pub created_at: NaiveDateTime,
+    #[serde(serialize_with = "serialize_dt_local")]
+    pub updated_at: NaiveDateTime,
+    #[serde(serialize_with = "serialize_opt_dt_local")]
+    pub started_at: Option<NaiveDateTime>,
+    #[serde(serialize_with = "serialize_opt_dt_local")]
+    pub completed_at: Option<NaiveDateTime>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreatePullTaskRequest {
+    pub url: String,
+    pub stream_id: String,
+    pub protocol: Option<String>,
+    pub channel_name: Option<String>,
+    pub play_item_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PullTaskListResponse {
+    pub total: i64,
+    pub running: i64,
+    pub items: Vec<PullTask>,
+}
+
 /// API: 通用响应
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiResponse<T: Serialize> {

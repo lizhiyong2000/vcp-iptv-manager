@@ -13,7 +13,8 @@ use crate::AppState;
 pub struct PlayItemQuery {
     pub channel: Option<String>,
     pub source: Option<String>,
-    pub is_valid: Option<bool>,
+    /// unvalidated | running | completed | snapshot_ok | failed
+    pub pull_status: Option<String>,
     pub keyword: Option<String>,
     #[serde(default = "default_page_num")]
     pub page_num: i32,
@@ -36,7 +37,7 @@ pub async fn list_playitems(
     match state.db.list_play_items(
         params.channel.as_deref(),
         params.source.as_deref(),
-        params.is_valid,
+        params.pull_status.as_deref(),
         params.keyword.as_deref(),
         params.page_num.max(1),
         params.page_size.min(200).max(1),

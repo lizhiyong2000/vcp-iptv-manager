@@ -28,13 +28,13 @@ pub struct Config {
     /// 初始播源列表
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
-    /// vcp-media-manager 地址（用于转发拉流验证任务）
-    #[serde(default = "default_media_manager_url")]
-    pub media_manager_url: String,
+    /// vcp-media-server 地址（用于转发拉流任务）
+    #[serde(default = "default_media_server_url", alias = "media_manager_url")]
+    pub media_server_url: String,
 }
 
-fn default_media_manager_url() -> String {
-    "http://127.0.0.1:8090".to_string()
+fn default_media_server_url() -> String {
+    "http://127.0.0.1:8081".to_string()
 }
 
 fn default_db_path() -> String {
@@ -70,7 +70,7 @@ impl Default for Config {
             request_timeout_secs: default_request_timeout_secs(),
             verify_concurrency: default_verify_concurrency(),
             sources: Vec::new(),
-            media_manager_url: default_media_manager_url(),
+            media_server_url: default_media_server_url(),
         }
     }
 }
@@ -138,6 +138,9 @@ impl Config {
             if !parsed.is_empty() {
                 config.sources = parsed;
             }
+        }
+        if let Ok(url) = std::env::var("MEDIA_SERVER_URL") {
+            config.media_server_url = url;
         }
 
         config
